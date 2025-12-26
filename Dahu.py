@@ -41,10 +41,14 @@ FR_DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 # =========================================================
 # DATABASE (PostgreSQL Neon via DATABASE_URL; SQLite fallback)
 # =========================================================
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+Base = declarative_base()
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 if DATABASE_URL:
-    # Force SQLAlchemy to use psycopg v3 if user provided plain postgresql://
+    # Force SQLAlchemy to use psycopg v3 even if user provided postgresql://
     if DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -56,7 +60,13 @@ if DATABASE_URL:
     )
 else:
     DB_PATH = os.environ.get("HOTEL_DB", "hotel.db")
-    engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+    engine = create_engine(
+        f"sqlite:///{DB_PATH}",
+        echo=False,
+        future=True,
+    )
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # =========================================================
 # MODELS
