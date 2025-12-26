@@ -1,4 +1,4 @@
-# dahu.py
+# Dahu.py
 import os
 import io
 import zipfile
@@ -39,19 +39,16 @@ COLOR_BLOCKED = "#95a5a6"   # gris
 FR_DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
 # =========================================================
-# DATABASE (PostgreSQL Neon via DATABASE_URL; SQLite fallback)
+# DB / ORM
 # =========================================================
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-
 Base = declarative_base()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgresql://"):
+    # Force psycopg v3
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 if DATABASE_URL:
-    # Force SQLAlchemy to use psycopg v3 even if user provided postgresql://
-    if DATABASE_URL.startswith("postgresql://"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
     engine = create_engine(
         DATABASE_URL,
         echo=False,
@@ -85,7 +82,7 @@ class Room(Base):
     __tablename__ = "rooms"
     id = Column(Integer, primary_key=True)
     number = Column(String(40), unique=True, nullable=False)  # identifiant interne
-    name = Column(String(80), nullable=False)                 # affichage partout
+    name = Column(String(80), nullable=False)                 # affichage
     price = Column(Float, default=95.0)
     housekeeping = Column(String(10), default="clean")        # clean / todo
     maintenance = Column(Boolean, default=False)
@@ -170,7 +167,7 @@ class Setting(Base):
     value = Column(String(400), default="")
 
 # =========================================================
-# DB INIT
+# INIT / AUTH HELPERS
 # =========================================================
 def hash_pw(pw: str) -> str:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -188,28 +185,28 @@ def log(db, username: str, action: str, meta: str = ""):
 def db_init():
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
-        # settings
         if not db.get(Setting, "invoice_seq"):
             db.add(Setting(key="invoice_seq", value="1"))
         if not db.get(Setting, "ipad_mode"):
             db.add(Setting(key="ipad_mode", value="0"))
 
-        # users
         if not db.query(User).filter(User.username == DEFAULT_ADMIN_USER).first():
             db.add(User(username=DEFAULT_ADMIN_USER, password_hash=hash_pw(DEFAULT_ADMIN_PASS), role="admin", active=True))
-            db.add(AuditLog(username="system", action="INIT", meta="Default admin created (admin/admin)"))
+            db.commit()
 
-        # rooms
         if db.query(Room).count() == 0:
             for i in range(1, 16):
                 number = str(100 + i)
                 db.add(Room(number=number, name=f"Chambre {number}", price=95.0))
-            db.add(AuditLog(username="system", action="INIT", meta="Default 15 rooms created"))
+            db.commit()
 
-        db.commit()
+def require_login():
+    if "user" not in st.session_state:
+        login_screen()
+        st.stop()
 
 # =========================================================
-# HELPERS
+# DATE HELPERS
 # =========================================================
 def week_start(d: dt.date) -> dt.date:
     return d - dt.timedelta(days=d.weekday())
@@ -220,6 +217,9 @@ def nights_count(ci: dt.date, co: dt.date) -> int:
 def iso_to_date(s: str) -> dt.date:
     return dt.date.fromisoformat(s.split("T")[0])
 
+# =========================================================
+# AVAILABILITY HELPERS
+# =========================================================
 def booking_conflicts_for_room(db, room_id: int, checkin: dt.date, checkout: dt.date, exclude_booking_id: int | None = None) -> bool:
     q = db.query(BookingRoom).join(Booking).filter(
         BookingRoom.room_id == room_id,
@@ -332,7 +332,7 @@ def build_invoice_pdf(booking: Booking) -> bytes:
     return buff.getvalue()
 
 # =========================================================
-# UI STYLE + iPad mode
+# CSS + iPad mode
 # =========================================================
 def inject_css(ipad: bool):
     st.markdown(
@@ -365,7 +365,6 @@ def inject_css(ipad: bool):
         """,
         unsafe_allow_html=True
     )
-
     if ipad:
         st.markdown(
             """
@@ -381,44 +380,7 @@ def inject_css(ipad: bool):
         )
 
 # =========================================================
-# AUTH
-# =========================================================
-def login_screen():
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.markdown(f"## {APP_TITLE}")
-        if os.path.exists("logo.png"):
-            st.image("logo.png", width="stretch")
-        st.markdown("### Connexion")
-        u = st.text_input("Nom d'utilisateur", value="admin", key="login_user")
-        p = st.text_input("Mot de passe", type="password", value="admin", key="login_pass")
-        if st.button("Se connecter", width="stretch", key="login_btn"):
-            with SessionLocal() as db:
-                user = db.query(User).filter(User.username == u, User.active == True).first()
-                if user and verify_pw(p, user.password_hash):
-                    st.session_state["user"] = {"username": user.username, "role": user.role}
-                    log(db, user.username, "LOGIN", "Connexion")
-                    st.rerun()
-                else:
-                    st.error("Identifiants invalides.")
-
-def require_login():
-    if "user" not in st.session_state:
-        login_screen()
-        st.stop()
-
-def do_logout():
-    try:
-        with SessionLocal() as db:
-            log(db, st.session_state.get("user", {}).get("username", "unknown"), "LOGOUT", "Déconnexion")
-    except Exception:
-        pass
-    st.session_state.pop("user", None)
-    st.query_params.clear()
-    st.rerun()
-
-# =========================================================
-# QUERY PARAMS NAV (fix Libre 100%)
+# QUERY PARAMS (planning reliable)
 # =========================================================
 def qp_open_new(room_id: int, day_iso: str):
     st.query_params.update({"action": "new", "room": str(room_id), "d": day_iso})
@@ -432,13 +394,82 @@ def qp_open_room(room_id: int):
 def qp_clear():
     st.query_params.clear()
 
+def apply_qp_to_panel():
+    qp = dict(st.query_params)
+    action = qp.get("action")
+    if not action:
+        return None
+
+    if action == "new" and qp.get("room") and qp.get("d"):
+        try:
+            rid = int(qp["room"])
+            day = dt.date.fromisoformat(qp["d"])
+            qp_clear()
+            return ("new", rid, day)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "edit" and qp.get("booking"):
+        try:
+            bid = int(qp["booking"])
+            qp_clear()
+            return ("edit", bid)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "room" and qp.get("room"):
+        try:
+            rid = int(qp["room"])
+            qp_clear()
+            return ("room", rid)
+        except Exception:
+            qp_clear()
+            return None
+
+    qp_clear()
+    return None
+
+# =========================================================
+# AUTH UI
+# =========================================================
+def login_screen():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.markdown(f"## {APP_TITLE}")
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+        st.markdown("### Connexion")
+        u = st.text_input("Nom d'utilisateur", value="admin", key="login_user")
+        p = st.text_input("Mot de passe", type="password", value="admin", key="login_pass")
+        if st.button("Se connecter", width="stretch", key="login_btn"):
+            with SessionLocal() as db:
+                user = db.query(User).filter(User.username == u, User.active == True).first()
+                if user and verify_pw(p, user.password_hash):
+                    st.session_state["user"] = {"username": user.username, "role": user.role}
+                    log(db, user.username, "LOGIN", "Connexion")
+                    st.rerun()
+                else:
+                    st.error("Identifiants invalides.")
+
+def do_logout():
+    try:
+        with SessionLocal() as db:
+            log(db, st.session_state.get("user", {}).get("username", "unknown"), "LOGOUT", "Déconnexion")
+    except Exception:
+        pass
+    st.session_state.pop("user", None)
+    qp_clear()
+    st.rerun()
+
 # =========================================================
 # NAV
 # =========================================================
 def sidebar_nav(ipad: bool):
     with st.sidebar:
         if os.path.exists("logo.png"):
-            st.image("logo.png", width="stretch")
+            st.image("logo.png", use_container_width=True)
 
         role = st.session_state["user"]["role"]
         pages_admin = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients", "Paramètres"]
@@ -448,14 +479,11 @@ def sidebar_nav(ipad: bool):
         page = st.radio("Menu", pages, label_visibility="collapsed", key="nav_page")
         st.divider()
         st.caption(f"Connecté : **{st.session_state['user']['username']}** ({role})")
-
         st.button("Logout", width="stretch", key="logout_btn", on_click=do_logout)
 
-        # quick toggle ipad (stored in DB too)
         st.divider()
         st.caption("Affichage")
         st.toggle("Mode iPad (plein écran)", value=ipad, key="ipad_toggle_local")
-
     return page
 
 # =========================================================
@@ -746,45 +774,6 @@ def booking_panel(db, b: Booking, prefix: str):
 # =========================================================
 # PAGES
 # =========================================================
-def apply_qp_to_panel():
-    # Interprète l'URL et ouvre le bon panneau (FIABLE sur Cloud)
-    qp = dict(st.query_params)
-    action = qp.get("action")
-    if not action:
-        return None
-
-    if action == "new" and qp.get("room") and qp.get("d"):
-        try:
-            room_id = int(qp["room"])
-            day = dt.date.fromisoformat(qp["d"])
-            qp_clear()
-            return ("new", room_id, day)
-        except Exception:
-            qp_clear()
-            return None
-
-    if action == "edit" and qp.get("booking"):
-        try:
-            bid = int(qp["booking"])
-            qp_clear()
-            return ("edit", bid)
-        except Exception:
-            qp_clear()
-            return None
-
-    if action == "room" and qp.get("room"):
-        try:
-            rid = int(qp["room"])
-            qp_clear()
-            return ("room", rid)
-        except Exception:
-            qp_clear()
-            return None
-
-    qp_clear()
-    return None
-
-
 def planning_week_page():
     st.markdown("## Planning")
 
@@ -939,14 +928,14 @@ def arrivals_departures_today_page():
 
         t1, t2 = st.tabs([f"Arrivées ({len(arrivals)})", f"Départs ({len(departures)})"])
         with t1:
-            if arrivals:
-                st.dataframe(pd.DataFrame([row_public(b) for b in arrivals]), width="stretch", hide_index=True)
-            else:
+            st.dataframe(pd.DataFrame([row_public(b) for b in arrivals]) if arrivals else pd.DataFrame(),
+                         width="stretch", hide_index=True)
+            if not arrivals:
                 st.info("Aucune arrivée aujourd’hui.")
         with t2:
-            if departures:
-                st.dataframe(pd.DataFrame([row_public(b) for b in departures]), width="stretch", hide_index=True)
-            else:
+            st.dataframe(pd.DataFrame([row_public(b) for b in departures]) if departures else pd.DataFrame(),
+                         width="stretch", hide_index=True)
+            if not departures:
                 st.info("Aucun départ aujourd’hui.")
 
         st.divider()
@@ -1060,20 +1049,17 @@ def dashboard_page():
 
         rooms = db.query(Room).all()
         nb_rooms = len(rooms)
-        nb_days = (end - start).days + 1
-        total_room_nights = nb_rooms * max(0, nb_days)
+        nb_days = max(0, (end - start).days + 1)
+        total_room_nights = nb_rooms * nb_days
 
-        # Toutes les réservations qui touchent la période
         all_bookings = db.query(Booking).filter(
             Booking.checkout > start,
             Booking.checkin < (end + dt.timedelta(days=1))
         ).all()
 
-        # CA payé (comme avant) + stats avancées
         paid_bookings = [b for b in all_bookings if b.paid]
 
         revenue_by_day = {}
-        room_revenue_paid = 0.0
         extras_paid = 0.0
 
         for b in paid_bookings:
@@ -1082,11 +1068,9 @@ def dashboard_page():
             stop = min(b.checkout, end + dt.timedelta(days=1))
             while cur < stop:
                 revenue_by_day[cur] = revenue_by_day.get(cur, 0.0) + per_night
-                room_revenue_paid += per_night
                 cur += dt.timedelta(days=1)
             extras_paid += float(b.extras or 0.0)
 
-        # Occupation (réservations payées OU non)
         occupied_room_nights = 0
         room_revenue_all = 0.0
         for b in all_bookings:
@@ -1107,19 +1091,17 @@ def dashboard_page():
         k1.metric("Taux d’occupation", f"{occupancy*100:.1f} %")
         k2.metric("RevPAR", f"{revpar:.2f} €")
         k3.metric("Nuits occupées", f"{occupied_room_nights} / {total_room_nights}")
-        k4.metric("CA payé (chambres)", f"{sum(revenue_by_day.values()):.2f} €")
+        k4.metric("Extras payés", f"{extras_paid:.2f} €")
 
         days = pd.date_range(start=start, end=end, freq="D")
         df = pd.DataFrame({"date": [d.date() for d in days], "ca": [float(revenue_by_day.get(d.date(), 0.0)) for d in days]})
         fig = px.bar(df, x="date", y="ca", title="Chiffre d'affaires payé (€/jour)")
         st.plotly_chart(fig, width="stretch")
 
-        st.metric("Extras payés (période)", f"{extras_paid:.2f} €")
-
         st.divider()
-        st.markdown("### Export mensuel (CSV)")
+        st.markdown("### Export mensuel (ZIP CSV)")
         month = st.text_input("Mois (YYYY-MM)", value=dt.date.today().strftime("%Y-%m"), key="exp_month")
-        if st.button("Générer export mensuel (ZIP)", width="stretch", key="exp_month_btn"):
+        if st.button("Générer export mensuel", width="stretch", key="exp_month_btn"):
             try:
                 y, m = map(int, month.split("-"))
                 m_start = dt.date(y, m, 1)
@@ -1164,7 +1146,6 @@ def dashboard_page():
                     "created_at": c.created_at.isoformat() if c.created_at else "",
                 })
 
-            # résumé
             total_ca = 0.0
             total_room = 0.0
             total_extras = 0.0
@@ -1307,12 +1288,7 @@ def settings_page():
 
         with t_logs:
             logs = db.query(AuditLog).order_by(AuditLog.ts.desc()).limit(300).all()
-            df = pd.DataFrame([{
-                "ts": l.ts,
-                "user": l.username,
-                "action": l.action,
-                "meta": l.meta
-            } for l in logs])
+            df = pd.DataFrame([{"ts": l.ts, "user": l.username, "action": l.action, "meta": l.meta} for l in logs])
             st.dataframe(df, width="stretch", hide_index=True)
 
 # =========================================================
@@ -1322,19 +1298,17 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     db_init()
 
-    # iPad mode default from DB + user toggle
     with SessionLocal() as db:
         s = db.get(Setting, "ipad_mode")
         ipad_default = (s.value or "0") == "1"
+
+    if "ipad_toggle_local" not in st.session_state:
+        st.session_state["ipad_toggle_local"] = ipad_default
 
     ipad_runtime = bool(st.session_state.get("ipad_toggle_local", ipad_default))
     inject_css(ipad_runtime)
 
     require_login()
-
-    # persist runtime ipad choice to session state
-    if "ipad_toggle_local" not in st.session_state:
-        st.session_state["ipad_toggle_local"] = ipad_default
 
     page = sidebar_nav(ipad_runtime)
 
@@ -1352,7 +1326,6 @@ def main():
         clients_page()
     elif page == "Paramètres":
         settings_page()
-
 
 if __name__ == "__main__":
     main()
