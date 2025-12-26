@@ -1,9 +1,8 @@
-streamlit
-sqlalchemy
-pandas
-plotly
-bcrypt
-reportlab
-openpyxl
-python-escpos
-streamlit-calendar
+streamlit==1.41.0
+sqlalchemy==2.0.36
+psycopg[binary]==3.2.3
+pandas==2.2.3
+plotly==5.24.1
+bcrypt==4.2.0
+reportlab==4.2.5
+streamlit-calendar==1.2.1
