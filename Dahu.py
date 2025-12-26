@@ -1,7 +1,7 @@
 # dahu.py
 import os
 import io
-import shutil
+import zipfile
 import datetime as dt
 
 import bcrypt
@@ -21,18 +21,15 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 from streamlit_calendar import calendar
 
-
 # =========================================================
 # CONFIG
 # =========================================================
 APP_TITLE = "Jean-Louis au Dahu — Planning"
-DB_PATH = os.environ.get("HOTEL_DB", "hotel.db")
+HOTEL_HEADER = "Le Clos de la Balme, Corrençon-en-Vercors"
+HOTEL_FOOTER = "Merci pour votre visite."
 
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASS = "admin"
-
-HOTEL_HEADER = "Le Clos de la Balme, Corrençon-en-Vercors"
-HOTEL_FOOTER = "Merci pour votre visite."
 
 COLOR_FREE = "#2ecc71"      # vert
 COLOR_RESERVED = "#e74c3c"  # rouge
@@ -41,10 +38,28 @@ COLOR_BLOCKED = "#95a5a6"   # gris
 
 FR_DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
-Base = declarative_base()
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# =========================================================
+# DATABASE (PostgreSQL Neon via DATABASE_URL; SQLite fallback)
+# =========================================================
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
+if DATABASE_URL:
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        future=True,
+        pool_pre_ping=True,
+    )
+else:
+    DB_PATH = os.environ.get("HOTEL_DB", "hotel.db")
+    engine = create_engine(
+        f"sqlite:///{DB_PATH}",
+        echo=False,
+        future=True,
+    )
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
 
 # =========================================================
 # MODELS
@@ -54,7 +69,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String(50), unique=True, nullable=False)
     password_hash = Column(String(200), nullable=False)
-    role = Column(String(20), default="admin")
+    role = Column(String(20), default="admin")  # admin / reception
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
@@ -62,8 +77,8 @@ class User(Base):
 class Room(Base):
     __tablename__ = "rooms"
     id = Column(Integer, primary_key=True)
-    number = Column(String(40), unique=True, nullable=False)  # identifiant interne unique
-    name = Column(String(80), nullable=False)                 # affiché partout
+    number = Column(String(40), unique=True, nullable=False)  # identifiant interne
+    name = Column(String(80), nullable=False)                 # affichage partout
     price = Column(Float, default=95.0)
     housekeeping = Column(String(10), default="clean")        # clean / todo
     maintenance = Column(Boolean, default=False)
@@ -147,39 +162,44 @@ class Setting(Base):
     key = Column(String(60), primary_key=True)
     value = Column(String(400), default="")
 
-
 # =========================================================
 # DB INIT
 # =========================================================
-def db_init():
-    Base.metadata.create_all(engine)
-    with SessionLocal() as db:
-        if not db.get(Setting, "invoice_seq"):
-            db.add(Setting(key="invoice_seq", value="1"))
+def hash_pw(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-        if not db.query(User).filter(User.username == DEFAULT_ADMIN_USER).first():
-            pw_hash = bcrypt.hashpw(DEFAULT_ADMIN_PASS.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            db.add(User(username=DEFAULT_ADMIN_USER, password_hash=pw_hash, role="admin", active=True))
-
-        if db.query(Room).count() == 0:
-            for i in range(1, 16):
-                number = str(100 + i)
-                db.add(Room(number=number, name=f"Chambre {number}", price=95.0))
-
-        db.commit()
-
+def verify_pw(pw: str, h: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), h.encode("utf-8"))
+    except Exception:
+        return False
 
 def log(db, username: str, action: str, meta: str = ""):
     db.add(AuditLog(username=username, action=action, meta=meta))
     db.commit()
 
+def db_init():
+    Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        # settings
+        if not db.get(Setting, "invoice_seq"):
+            db.add(Setting(key="invoice_seq", value="1"))
+        if not db.get(Setting, "ipad_mode"):
+            db.add(Setting(key="ipad_mode", value="0"))
 
-def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
-    except Exception:
-        return False
+        # users
+        if not db.query(User).filter(User.username == DEFAULT_ADMIN_USER).first():
+            db.add(User(username=DEFAULT_ADMIN_USER, password_hash=hash_pw(DEFAULT_ADMIN_PASS), role="admin", active=True))
+            db.add(AuditLog(username="system", action="INIT", meta="Default admin created (admin/admin)"))
 
+        # rooms
+        if db.query(Room).count() == 0:
+            for i in range(1, 16):
+                number = str(100 + i)
+                db.add(Room(number=number, name=f"Chambre {number}", price=95.0))
+            db.add(AuditLog(username="system", action="INIT", meta="Default 15 rooms created"))
+
+        db.commit()
 
 # =========================================================
 # HELPERS
@@ -187,14 +207,11 @@ def verify_password(password: str, password_hash: str) -> bool:
 def week_start(d: dt.date) -> dt.date:
     return d - dt.timedelta(days=d.weekday())
 
-
-def nights_count(checkin: dt.date, checkout: dt.date) -> int:
-    return max(0, (checkout - checkin).days)
-
+def nights_count(ci: dt.date, co: dt.date) -> int:
+    return max(0, (co - ci).days)
 
 def iso_to_date(s: str) -> dt.date:
     return dt.date.fromisoformat(s.split("T")[0])
-
 
 def booking_conflicts_for_room(db, room_id: int, checkin: dt.date, checkout: dt.date, exclude_booking_id: int | None = None) -> bool:
     q = db.query(BookingRoom).join(Booking).filter(
@@ -206,7 +223,6 @@ def booking_conflicts_for_room(db, room_id: int, checkin: dt.date, checkout: dt.
         q = q.filter(Booking.id != exclude_booking_id)
     return q.first() is not None
 
-
 def room_blocked_in_range(db, room_id: int, checkin: dt.date, checkout: dt.date) -> bool:
     blocks = db.query(MaintenanceBlock).filter(
         MaintenanceBlock.room_id == room_id,
@@ -215,7 +231,6 @@ def room_blocked_in_range(db, room_id: int, checkin: dt.date, checkout: dt.date)
     ).all()
     return len(blocks) > 0
 
-
 def next_invoice_number(db) -> str:
     s = db.get(Setting, "invoice_seq")
     seq = int(s.value or "1")
@@ -223,7 +238,6 @@ def next_invoice_number(db) -> str:
     s.value = str(seq + 1)
     db.commit()
     return inv
-
 
 # =========================================================
 # PDF
@@ -310,11 +324,10 @@ def build_invoice_pdf(booking: Booking) -> bytes:
     c.save()
     return buff.getvalue()
 
-
 # =========================================================
-# UI STYLE
+# UI STYLE + iPad mode
 # =========================================================
-def inject_css():
+def inject_css(ipad: bool):
     st.markdown(
         f"""
         <style>
@@ -346,42 +359,47 @@ def inject_css():
         unsafe_allow_html=True
     )
 
+    if ipad:
+        st.markdown(
+            """
+            <style>
+              header {visibility: hidden;}
+              #MainMenu {visibility: hidden;}
+              footer {visibility: hidden;}
+              [data-testid="stSidebar"] {display: none;}
+              .main .block-container {max-width: 1600px; padding-top: 0.5rem;}
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
 
 # =========================================================
 # AUTH
 # =========================================================
 def login_screen():
-    inject_css()
-
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         st.markdown(f"## {APP_TITLE}")
         if os.path.exists("logo.png"):
             st.image("logo.png", width="stretch")
-
         st.markdown("### Connexion")
         u = st.text_input("Nom d'utilisateur", value="admin", key="login_user")
         p = st.text_input("Mot de passe", type="password", value="admin", key="login_pass")
         if st.button("Se connecter", width="stretch", key="login_btn"):
             with SessionLocal() as db:
                 user = db.query(User).filter(User.username == u, User.active == True).first()
-                if user and verify_password(p, user.password_hash):
+                if user and verify_pw(p, user.password_hash):
                     st.session_state["user"] = {"username": user.username, "role": user.role}
                     log(db, user.username, "LOGIN", "Connexion")
                     st.rerun()
                 else:
                     st.error("Identifiants invalides.")
 
-
 def require_login():
     if "user" not in st.session_state:
         login_screen()
         st.stop()
 
-
-# =========================================================
-# NAV
-# =========================================================
 def do_logout():
     try:
         with SessionLocal() as db:
@@ -389,48 +407,52 @@ def do_logout():
     except Exception:
         pass
     st.session_state.pop("user", None)
+    st.query_params.clear()
     st.rerun()
 
+# =========================================================
+# QUERY PARAMS NAV (fix Libre 100%)
+# =========================================================
+def qp_open_new(room_id: int, day_iso: str):
+    st.query_params.update({"action": "new", "room": str(room_id), "d": day_iso})
 
-def sidebar_nav():
+def qp_open_edit(booking_id: int):
+    st.query_params.update({"action": "edit", "booking": str(booking_id)})
+
+def qp_open_room(room_id: int):
+    st.query_params.update({"action": "room", "room": str(room_id)})
+
+def qp_clear():
+    st.query_params.clear()
+
+# =========================================================
+# NAV
+# =========================================================
+def sidebar_nav(ipad: bool):
     with st.sidebar:
         if os.path.exists("logo.png"):
             st.image("logo.png", width="stretch")
 
-        st.markdown("### Navigation")
-        page = st.radio(
-            "Menu",
-            ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients", "Paramètres"],
-            label_visibility="collapsed",
-            key="nav_page"
-        )
+        role = st.session_state["user"]["role"]
+        pages_admin = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients", "Paramètres"]
+        pages_reception = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients"]
+        pages = pages_admin if role == "admin" else pages_reception
+
+        page = st.radio("Menu", pages, label_visibility="collapsed", key="nav_page")
         st.divider()
-        st.caption(f"Connecté : **{st.session_state['user']['username']}**")
+        st.caption(f"Connecté : **{st.session_state['user']['username']}** ({role})")
+
         st.button("Logout", width="stretch", key="logout_btn", on_click=do_logout)
+
+        # quick toggle ipad (stored in DB too)
+        st.divider()
+        st.caption("Affichage")
+        st.toggle("Mode iPad (plein écran)", value=ipad, key="ipad_toggle_local")
+
     return page
 
-
 # =========================================================
-# PANEL STATE CALLBACKS (fiabilise le planning)
-# =========================================================
-def set_panel_room(room_id: int):
-    st.session_state["panel"] = ("room", int(room_id))
-
-
-def set_panel_new(room_id: int, day_iso: str):
-    st.session_state["panel"] = ("new", int(room_id), dt.date.fromisoformat(day_iso))
-
-
-def set_panel_edit(booking_id: int):
-    st.session_state["panel"] = ("edit", int(booking_id))
-
-
-def close_panel():
-    st.session_state["panel"] = None
-
-
-# =========================================================
-# ROOM CONTROLS
+# PANELS
 # =========================================================
 def room_controls(db, room: Room, prefix: str):
     st.markdown(f"### {room.name}")
@@ -462,9 +484,6 @@ def room_controls(db, room: Room, prefix: str):
             st.rerun()
 
 
-# =========================================================
-# CREATE BOOKING PANEL (auto-select client)
-# =========================================================
 def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefix: str):
     st.markdown("### Nouveau dossier (multi-chambre)")
 
@@ -534,7 +553,6 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
 
     client = db.get(Client, st.session_state[selected_client_key]) if st.session_state[selected_client_key] else None
 
-    # raisons blocage (affichées)
     reasons = []
     if checkout <= checkin:
         reasons.append("Dates invalides (départ <= arrivée)")
@@ -545,7 +563,6 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
     if reasons:
         st.warning("Impossible de créer : " + " | ".join(reasons))
 
-    # disponibilité
     if checkout > checkin and selected_room_ids:
         problems = []
         for rid in selected_room_ids:
@@ -567,7 +584,6 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
 
     disabled = (checkout <= checkin) or (client is None) or (len(selected_room_ids) == 0)
     if st.button("Créer le dossier", width="stretch", type="primary", disabled=disabled, key=f"{prefix}_create_btn"):
-        # sécurité dispo
         for rid in selected_room_ids:
             r = db.get(Room, rid)
             if r.maintenance or room_blocked_in_range(db, rid, checkin, checkout) or booking_conflicts_for_room(db, rid, checkin, checkout):
@@ -593,13 +609,11 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
 
         db.commit()
         log(db, st.session_state["user"]["username"], "BOOKING_CREATE", f"booking={b.id}")
-        st.session_state["panel"] = ("edit", b.id)
+
+        qp_open_edit(b.id)
         st.rerun()
 
 
-# =========================================================
-# BOOKING PANEL (modif / suppression)
-# =========================================================
 def booking_panel(db, b: Booking, prefix: str):
     client = b.client
     st.markdown(f"### Dossier #{b.id}")
@@ -719,15 +733,58 @@ def booking_panel(db, b: Booking, prefix: str):
             db.delete(b)
             db.commit()
             log(db, st.session_state["user"]["username"], "BOOKING_DELETE", f"booking={bid}")
-            st.session_state["panel"] = None
+            qp_clear()
             st.rerun()
-
 
 # =========================================================
 # PAGES
 # =========================================================
+def apply_qp_to_panel():
+    # Interprète l'URL et ouvre le bon panneau (FIABLE sur Cloud)
+    qp = dict(st.query_params)
+    action = qp.get("action")
+    if not action:
+        return None
+
+    if action == "new" and qp.get("room") and qp.get("d"):
+        try:
+            room_id = int(qp["room"])
+            day = dt.date.fromisoformat(qp["d"])
+            qp_clear()
+            return ("new", room_id, day)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "edit" and qp.get("booking"):
+        try:
+            bid = int(qp["booking"])
+            qp_clear()
+            return ("edit", bid)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "room" and qp.get("room"):
+        try:
+            rid = int(qp["room"])
+            qp_clear()
+            return ("room", rid)
+        except Exception:
+            qp_clear()
+            return None
+
+    qp_clear()
+    return None
+
+
 def planning_week_page():
     st.markdown("## Planning")
+
+    panel_from_url = apply_qp_to_panel()
+    if panel_from_url:
+        st.session_state["panel"] = panel_from_url
+        st.rerun()
 
     if "panel" not in st.session_state:
         st.session_state["panel"] = None
@@ -774,7 +831,7 @@ def planning_week_page():
                     label,
                     width="stretch",
                     key=f"room_btn_{room.id}",
-                    on_click=set_panel_room,
+                    on_click=qp_open_room,
                     args=(room.id,)
                 )
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -805,8 +862,8 @@ def planning_week_page():
                             "Libre",
                             width="stretch",
                             key=f"free_{room.id}_{d.isoformat()}",
-                            on_click=set_panel_new,
-                            args=(room.id, d.isoformat())
+                            on_click=qp_open_new,
+                            args=(room.id, d.isoformat()),
                         )
                         st.markdown("</div>", unsafe_allow_html=True)
                     else:
@@ -818,8 +875,8 @@ def planning_week_page():
                             f"{label}\n{client_name}",
                             width="stretch",
                             key=f"bk_{b.id}_{room.id}_{d.isoformat()}",
-                            on_click=set_panel_edit,
-                            args=(b.id,)
+                            on_click=qp_open_edit,
+                            args=(b.id,),
                         )
                         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -827,10 +884,13 @@ def planning_week_page():
 
         panel = st.session_state.get("panel")
         if panel:
-            st.button("Fermer le panneau", width="stretch", key="close_panel_btn", on_click=close_panel)
-            st.markdown("## Panneau d'action")
+            if st.button("Fermer le panneau", width="stretch", key="close_panel_btn"):
+                st.session_state["panel"] = None
+                st.rerun()
 
+            st.markdown("## Panneau d'action")
             kind = panel[0]
+
             if kind == "room":
                 r = db.get(Room, int(panel[1]))
                 if r:
@@ -848,11 +908,8 @@ def planning_week_page():
 
 def arrivals_departures_today_page():
     st.markdown("## Arrivées / Départs aujourd’hui")
-
-    if "panel" not in st.session_state:
-        st.session_state["panel"] = None
-
     today = dt.date.today()
+
     with SessionLocal() as db:
         arrivals = db.query(Booking).filter(Booking.checkin == today).order_by(Booking.created_at.desc()).all()
         departures = db.query(Booking).filter(Booking.checkout == today).order_by(Booking.created_at.desc()).all()
@@ -879,7 +936,6 @@ def arrivals_departures_today_page():
                 st.dataframe(pd.DataFrame([row_public(b) for b in arrivals]), width="stretch", hide_index=True)
             else:
                 st.info("Aucune arrivée aujourd’hui.")
-
         with t2:
             if departures:
                 st.dataframe(pd.DataFrame([row_public(b) for b in departures]), width="stretch", hide_index=True)
@@ -888,15 +944,9 @@ def arrivals_departures_today_page():
 
         st.divider()
         bid = st.number_input("Ouvrir un dossier (ID)", min_value=0, value=0, step=1, key="ad_open_id")
-        st.button("Ouvrir", width="stretch", key="ad_open_btn", on_click=(lambda: set_panel_edit(int(bid))) if bid else None)
-
-        panel = st.session_state.get("panel")
-        if panel and panel[0] == "edit":
-            st.divider()
-            st.button("Fermer le panneau", width="stretch", key="ad_close_panel", on_click=close_panel)
-            b = db.get(Booking, int(panel[1]))
-            if b:
-                booking_panel(db, b, prefix="ad_edit")
+        if st.button("Ouvrir", width="stretch", key="ad_open_btn") and bid > 0:
+            qp_open_edit(int(bid))
+            st.rerun()
 
 
 def calendar_page():
@@ -922,9 +972,8 @@ def calendar_page():
                 "end": b.checkout.isoformat(),
                 "backgroundColor": (COLOR_PAID if b.paid else COLOR_RESERVED),
                 "borderColor": (COLOR_PAID if b.paid else COLOR_RESERVED),
-                "editable": True
+                "editable": False
             })
-
         for bl in blocks:
             events.append({
                 "id": f"blk_{bl.id}",
@@ -938,55 +987,31 @@ def calendar_page():
 
         options = {
             "locale": "fr",
-            "initialView": st.session_state.get("cal_view", "dayGridMonth"),
+            "initialView": "dayGridMonth",
             "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,timeGridWeek"},
             "selectable": True,
-            "editable": True,
-            "eventDurationEditable": True,
-            "eventStartEditable": True,
+            "editable": False,
             "dayMaxEvents": True,
         }
 
         cal_state = calendar(events=events, options=options, key="fullcal_main")
-        if isinstance(cal_state, dict) and cal_state.get("view"):
-            st.session_state["cal_view"] = cal_state["view"]
-
-        if "cal_panel" not in st.session_state:
-            st.session_state["cal_panel"] = None
 
         if isinstance(cal_state, dict) and cal_state.get("select"):
             if not room.maintenance:
                 s = iso_to_date(cal_state["select"]["start"])
-                st.session_state["cal_panel"] = ("new", room.id, s)
+                qp_open_new(room.id, s.isoformat())
+                st.rerun()
 
         if isinstance(cal_state, dict) and cal_state.get("eventClick"):
             eid = str(cal_state["eventClick"]["event"]["id"])
             if eid.startswith("bk_"):
                 bid = int(eid.replace("bk_", ""))
-                st.session_state["cal_panel"] = ("edit", bid)
-
-        st.divider()
-        if st.button("Fermer le panneau", width="stretch", key="cal_close"):
-            st.session_state["cal_panel"] = None
-            st.rerun()
-
-        panel = st.session_state.get("cal_panel")
-        if panel:
-            if panel[0] == "new":
-                r = db.get(Room, int(panel[1]))
-                if r:
-                    create_booking_panel(db, default_room=r, default_checkin=panel[2], prefix="cal_new")
-            elif panel[0] == "edit":
-                b = db.get(Booking, int(panel[1]))
-                if b:
-                    booking_panel(db, b, prefix="cal_edit")
+                qp_open_edit(bid)
+                st.rerun()
 
 
 def bookings_list_page():
     st.markdown("## Dossiers")
-    if "panel" not in st.session_state:
-        st.session_state["panel"] = None
-
     with SessionLocal() as db:
         q = st.text_input("Recherche client (nom / tel / email)", key="bk_q")
         query = db.query(Booking).join(Client)
@@ -1012,20 +1037,13 @@ def bookings_list_page():
 
         bid = st.number_input("Ouvrir dossier (ID)", min_value=0, value=0, step=1, key="bk_open_id")
         if st.button("Ouvrir", width="stretch", key="bk_open_btn") and bid > 0:
-            st.session_state["panel"] = ("edit", int(bid))
+            qp_open_edit(int(bid))
             st.rerun()
-
-        panel = st.session_state.get("panel")
-        if panel and panel[0] == "edit":
-            st.divider()
-            st.button("Fermer le panneau", width="stretch", key="bk_close_panel", on_click=close_panel)
-            b = db.get(Booking, int(panel[1]))
-            if b:
-                booking_panel(db, b, prefix="bk_edit")
 
 
 def dashboard_page():
     st.markdown("## Dashboard")
+
     with SessionLocal() as db:
         c1, c2 = st.columns(2)
         with c1:
@@ -1033,28 +1051,145 @@ def dashboard_page():
         with c2:
             end = st.date_input("Au", value=dt.date.today(), key="dash_end")
 
-        bookings = db.query(Booking).filter(
-            Booking.paid == True,
+        rooms = db.query(Room).all()
+        nb_rooms = len(rooms)
+        nb_days = (end - start).days + 1
+        total_room_nights = nb_rooms * max(0, nb_days)
+
+        # Toutes les réservations qui touchent la période
+        all_bookings = db.query(Booking).filter(
             Booking.checkout > start,
             Booking.checkin < (end + dt.timedelta(days=1))
         ).all()
 
+        # CA payé (comme avant) + stats avancées
+        paid_bookings = [b for b in all_bookings if b.paid]
+
         revenue_by_day = {}
-        for b in bookings:
+        room_revenue_paid = 0.0
+        extras_paid = 0.0
+
+        for b in paid_bookings:
             per_night = sum(float(br.price_per_night) for br in b.rooms)
             cur = max(b.checkin, start)
             stop = min(b.checkout, end + dt.timedelta(days=1))
             while cur < stop:
                 revenue_by_day[cur] = revenue_by_day.get(cur, 0.0) + per_night
+                room_revenue_paid += per_night
                 cur += dt.timedelta(days=1)
-            if start <= b.checkout <= end:
-                revenue_by_day[b.checkout] = revenue_by_day.get(b.checkout, 0.0) + float(b.extras or 0.0)
+            extras_paid += float(b.extras or 0.0)
+
+        # Occupation (réservations payées OU non)
+        occupied_room_nights = 0
+        room_revenue_all = 0.0
+        for b in all_bookings:
+            nights = 0
+            cur = max(b.checkin, start)
+            stop = min(b.checkout, end + dt.timedelta(days=1))
+            while cur < stop:
+                nights += 1
+                cur += dt.timedelta(days=1)
+            nb = max(1, len(b.rooms))
+            occupied_room_nights += nights * nb
+            room_revenue_all += sum(float(br.price_per_night) for br in b.rooms) * nights
+
+        occupancy = (occupied_room_nights / total_room_nights) if total_room_nights else 0.0
+        revpar = (room_revenue_all / total_room_nights) if total_room_nights else 0.0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Taux d’occupation", f"{occupancy*100:.1f} %")
+        k2.metric("RevPAR", f"{revpar:.2f} €")
+        k3.metric("Nuits occupées", f"{occupied_room_nights} / {total_room_nights}")
+        k4.metric("CA payé (chambres)", f"{sum(revenue_by_day.values()):.2f} €")
 
         days = pd.date_range(start=start, end=end, freq="D")
         df = pd.DataFrame({"date": [d.date() for d in days], "ca": [float(revenue_by_day.get(d.date(), 0.0)) for d in days]})
-        fig = px.bar(df, x="date", y="ca", title="Chiffre d'affaires (€/jour)")
+        fig = px.bar(df, x="date", y="ca", title="Chiffre d'affaires payé (€/jour)")
         st.plotly_chart(fig, width="stretch")
-        st.metric("CA total période", f"{df['ca'].sum():.2f} €")
+
+        st.metric("Extras payés (période)", f"{extras_paid:.2f} €")
+
+        st.divider()
+        st.markdown("### Export mensuel (CSV)")
+        month = st.text_input("Mois (YYYY-MM)", value=dt.date.today().strftime("%Y-%m"), key="exp_month")
+        if st.button("Générer export mensuel (ZIP)", width="stretch", key="exp_month_btn"):
+            try:
+                y, m = map(int, month.split("-"))
+                m_start = dt.date(y, m, 1)
+                m_end = dt.date(y + (1 if m == 12 else 0), (1 if m == 12 else m + 1), 1)
+            except Exception:
+                st.error("Format attendu : YYYY-MM (ex: 2025-12)")
+                return
+
+            m_bookings = db.query(Booking).filter(
+                Booking.checkout > m_start,
+                Booking.checkin < m_end
+            ).all()
+
+            b_rows = []
+            for b in m_bookings:
+                nights = nights_count(b.checkin, b.checkout)
+                b_rows.append({
+                    "booking_id": b.id,
+                    "client": b.client.full_name if b.client else "",
+                    "checkin": b.checkin.isoformat(),
+                    "checkout": b.checkout.isoformat(),
+                    "nights": nights,
+                    "rooms": ", ".join([br.room.name for br in b.rooms]),
+                    "paid": b.paid,
+                    "invoice": b.invoice_number,
+                    "deposit": float(b.deposit or 0.0),
+                    "extras": float(b.extras or 0.0),
+                    "payment_method": b.payment_method,
+                    "created_by": b.created_by,
+                    "created_at": b.created_at.isoformat() if b.created_at else "",
+                })
+
+            c_rows = []
+            clients = db.query(Client).filter(Client.created_at >= m_start, Client.created_at < m_end).all()
+            for c in clients:
+                c_rows.append({
+                    "client_id": c.id,
+                    "full_name": c.full_name,
+                    "phone": c.phone,
+                    "email": c.email,
+                    "address": c.address,
+                    "created_at": c.created_at.isoformat() if c.created_at else "",
+                })
+
+            # résumé
+            total_ca = 0.0
+            total_room = 0.0
+            total_extras = 0.0
+            for b in m_bookings:
+                nights = nights_count(b.checkin, b.checkout)
+                rooms_total = sum(float(br.price_per_night) for br in b.rooms) * nights
+                total_room += rooms_total
+                total_extras += float(b.extras or 0.0)
+                total_ca += rooms_total + float(b.extras or 0.0)
+
+            summary = pd.DataFrame([{
+                "month": month,
+                "bookings": len(m_bookings),
+                "room_revenue": total_room,
+                "extras": total_extras,
+                "total": total_ca,
+            }])
+
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr(f"bookings_{month}.csv", pd.DataFrame(b_rows).to_csv(index=False))
+                z.writestr(f"clients_{month}.csv", pd.DataFrame(c_rows).to_csv(index=False))
+                z.writestr(f"summary_{month}.csv", summary.to_csv(index=False))
+
+            st.download_button(
+                "Télécharger l'export ZIP",
+                data=buf.getvalue(),
+                file_name=f"export_{month}.zip",
+                mime="application/zip",
+                width="stretch",
+                key="exp_dl"
+            )
 
 
 def clients_page():
@@ -1081,8 +1216,12 @@ def clients_page():
 
 def settings_page():
     st.markdown("## Paramètres")
+    if st.session_state["user"]["role"] != "admin":
+        st.warning("Accès réservé à l’administrateur.")
+        return
+
     with SessionLocal() as db:
-        t_rooms, t_backup = st.tabs(["Chambres", "Sauvegarde"])
+        t_rooms, t_users, t_ipad, t_logs = st.tabs(["Chambres", "Utilisateurs", "Mode iPad", "Logs"])
 
         with t_rooms:
             rooms = db.query(Room).order_by(Room.number.asc()).all()
@@ -1090,7 +1229,7 @@ def settings_page():
             room_id = int(choice.split("[id:")[1].replace("]", "").strip())
             room = db.get(Room, room_id)
 
-            new_name = st.text_input("Nom affiché (planning)", value=room.name, key="set_room_name")
+            new_name = st.text_input("Nom affiché", value=room.name, key="set_room_name")
             new_number = st.text_input("Identifiant interne (unique)", value=room.number, key="set_room_number")
             new_price = st.number_input("Prix / nuit (€)", min_value=0.0, value=float(room.price), step=1.0, key="set_room_price")
             maint = st.toggle("Travaux global", value=room.maintenance, key="set_room_maint")
@@ -1101,38 +1240,96 @@ def settings_page():
                 room.price = float(new_price)
                 room.maintenance = maint
                 db.commit()
+                log(db, st.session_state["user"]["username"], "ROOM_UPDATE", f"room={room.id}")
+                st.success("Chambre mise à jour.")
                 st.rerun()
 
-        with t_backup:
-            if st.button("Créer une sauvegarde (.db)", width="stretch", key="backup_btn"):
-                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = f"hotel_backup_{ts}.db"
-                shutil.copyfile(DB_PATH, backup_path)
-                st.success(f"Sauvegarde créée : {backup_path}")
-                with open(backup_path, "rb") as f:
-                    st.download_button(
-                        "Télécharger la sauvegarde",
-                        data=f.read(),
-                        file_name=backup_path,
-                        mime="application/octet-stream",
-                        width="stretch",
-                        key="backup_download"
-                    )
+        with t_users:
+            st.markdown("### Créer un utilisateur")
+            nu = st.text_input("Username", key="u_new_user")
+            npw = st.text_input("Mot de passe", type="password", key="u_new_pw")
+            nrole = st.selectbox("Rôle", ["reception", "admin"], key="u_new_role")
+            if st.button("Créer", width="stretch", key="u_new_btn"):
+                if not nu.strip() or not npw.strip():
+                    st.error("Username et mot de passe requis.")
+                else:
+                    if db.query(User).filter(User.username == nu.strip()).first():
+                        st.error("Utilisateur déjà existant.")
+                    else:
+                        db.add(User(username=nu.strip(), password_hash=hash_pw(npw.strip()), role=nrole, active=True))
+                        db.commit()
+                        log(db, st.session_state["user"]["username"], "USER_CREATE", f"{nu.strip()} role={nrole}")
+                        st.success("Utilisateur créé.")
+                        st.rerun()
 
+            st.divider()
+            st.markdown("### Gérer les utilisateurs")
+            users = db.query(User).order_by(User.username.asc()).all()
+            u_choice = st.selectbox("Utilisateur", [f"{u.username} (role={u.role}, active={u.active}) [id:{u.id}]" for u in users], key="u_choice")
+            uid = int(u_choice.split("[id:")[1].replace("]", "").strip())
+            u = db.get(User, uid)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                u_role = st.selectbox("Rôle", ["reception", "admin"], index=0 if u.role == "reception" else 1, key="u_role_set")
+                u_active = st.toggle("Actif", value=bool(u.active), key="u_active_set")
+            with c2:
+                reset_pw = st.text_input("Nouveau mot de passe", type="password", key="u_reset_pw")
+
+            if st.button("Enregistrer utilisateur", width="stretch", key="u_save_btn"):
+                u.role = u_role
+                u.active = bool(u_active)
+                if reset_pw.strip():
+                    u.password_hash = hash_pw(reset_pw.strip())
+                    log(db, st.session_state["user"]["username"], "USER_PW_RESET", f"{u.username}")
+                db.commit()
+                log(db, st.session_state["user"]["username"], "USER_UPDATE", f"{u.username} role={u.role} active={u.active}")
+                st.success("Utilisateur mis à jour.")
+                st.rerun()
+
+        with t_ipad:
+            s = db.get(Setting, "ipad_mode")
+            current = (s.value or "0") == "1"
+            v = st.toggle("Activer mode iPad par défaut", value=current, key="ipad_default_toggle")
+            if st.button("Enregistrer", width="stretch", key="ipad_save_btn"):
+                s.value = "1" if v else "0"
+                db.commit()
+                log(db, st.session_state["user"]["username"], "IPAD_DEFAULT", s.value)
+                st.success("OK.")
+                st.rerun()
+
+        with t_logs:
+            logs = db.query(AuditLog).order_by(AuditLog.ts.desc()).limit(300).all()
+            df = pd.DataFrame([{
+                "ts": l.ts,
+                "user": l.username,
+                "action": l.action,
+                "meta": l.meta
+            } for l in logs])
+            st.dataframe(df, width="stretch", hide_index=True)
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    inject_css()
     db_init()
+
+    # iPad mode default from DB + user toggle
+    with SessionLocal() as db:
+        s = db.get(Setting, "ipad_mode")
+        ipad_default = (s.value or "0") == "1"
+
+    ipad_runtime = bool(st.session_state.get("ipad_toggle_local", ipad_default))
+    inject_css(ipad_runtime)
+
     require_login()
 
-    if "panel" not in st.session_state:
-        st.session_state["panel"] = None
+    # persist runtime ipad choice to session state
+    if "ipad_toggle_local" not in st.session_state:
+        st.session_state["ipad_toggle_local"] = ipad_default
 
-    page = sidebar_nav()
+    page = sidebar_nav(ipad_runtime)
 
     if page == "Planning":
         planning_week_page()
