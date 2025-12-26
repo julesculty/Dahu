@@ -45,23 +45,13 @@ Base = declarative_base()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if DATABASE_URL.startswith("postgresql://"):
-    # Force psycopg v3
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 if DATABASE_URL:
-    engine = create_engine(
-        DATABASE_URL,
-        echo=False,
-        future=True,
-        pool_pre_ping=True,
-    )
+    engine = create_engine(DATABASE_URL, echo=False, future=True, pool_pre_ping=True)
 else:
     DB_PATH = os.environ.get("HOTEL_DB", "hotel.db")
-    engine = create_engine(
-        f"sqlite:///{DB_PATH}",
-        echo=False,
-        future=True,
-    )
+    engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -167,7 +157,7 @@ class Setting(Base):
     value = Column(String(400), default="")
 
 # =========================================================
-# INIT / AUTH HELPERS
+# INIT / HELPERS
 # =========================================================
 def hash_pw(pw: str) -> str:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -192,22 +182,19 @@ def db_init():
 
         if not db.query(User).filter(User.username == DEFAULT_ADMIN_USER).first():
             db.add(User(username=DEFAULT_ADMIN_USER, password_hash=hash_pw(DEFAULT_ADMIN_PASS), role="admin", active=True))
-            db.commit()
 
         if db.query(Room).count() == 0:
             for i in range(1, 16):
                 number = str(100 + i)
                 db.add(Room(number=number, name=f"Chambre {number}", price=95.0))
-            db.commit()
+
+        db.commit()
 
 def require_login():
     if "user" not in st.session_state:
         login_screen()
         st.stop()
 
-# =========================================================
-# DATE HELPERS
-# =========================================================
 def week_start(d: dt.date) -> dt.date:
     return d - dt.timedelta(days=d.weekday())
 
@@ -217,9 +204,6 @@ def nights_count(ci: dt.date, co: dt.date) -> int:
 def iso_to_date(s: str) -> dt.date:
     return dt.date.fromisoformat(s.split("T")[0])
 
-# =========================================================
-# AVAILABILITY HELPERS
-# =========================================================
 def booking_conflicts_for_room(db, room_id: int, checkin: dt.date, checkout: dt.date, exclude_booking_id: int | None = None) -> bool:
     q = db.query(BookingRoom).join(Booking).filter(
         BookingRoom.room_id == room_id,
@@ -245,6 +229,162 @@ def next_invoice_number(db) -> str:
     s.value = str(seq + 1)
     db.commit()
     return inv
+
+# =========================================================
+# CSS + iPad mode
+# =========================================================
+def inject_css(ipad: bool):
+    st.markdown(
+        f"""
+        <style>
+        .main .block-container {{ padding-top: 1rem; padding-bottom: 2rem; max-width: 1450px; }}
+
+        .cellwrap {{ border-radius: 14px; padding: 0px; }}
+        .cellwrap button {{
+            width: 100% !important;
+            height: 74px !important;
+            border-radius: 14px !important;
+            border: none !important;
+            font-weight: 900 !important;
+            color: white !important;
+            white-space: normal !important;
+            line-height: 1.15 !important;
+        }}
+        .cellwrap.free button {{ background: {COLOR_FREE} !important; }}
+        .cellwrap.reserved button {{ background: {COLOR_RESERVED} !important; }}
+        .cellwrap.paid button {{ background: {COLOR_PAID} !important; }}
+        .cellwrap.blocked button {{ background: {COLOR_BLOCKED} !important; cursor: not-allowed !important; }}
+
+        .roomwrap button {{
+            width: 100% !important;
+            height: 58px !important;
+            border-radius: 14px !important;
+            font-weight: 900 !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    if ipad:
+        st.markdown(
+            """
+            <style>
+              header {visibility: hidden;}
+              #MainMenu {visibility: hidden;}
+              footer {visibility: hidden;}
+              [data-testid="stSidebar"] {display: none;}
+              .main .block-container {max-width: 1600px; padding-top: 0.5rem;}
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+
+# =========================================================
+# QUERY PARAMS (reliable click)
+# =========================================================
+def qp_open_new(room_id: int, day_iso: str):
+    st.query_params.update({"action": "new", "room": str(room_id), "d": day_iso})
+
+def qp_open_edit(booking_id: int):
+    st.query_params.update({"action": "edit", "booking": str(booking_id)})
+
+def qp_open_room(room_id: int):
+    st.query_params.update({"action": "room", "room": str(room_id)})
+
+def qp_clear():
+    st.query_params.clear()
+
+def apply_qp_to_panel():
+    qp = dict(st.query_params)
+    action = qp.get("action")
+    if not action:
+        return None
+
+    if action == "new" and qp.get("room") and qp.get("d"):
+        try:
+            rid = int(qp["room"])
+            day = dt.date.fromisoformat(qp["d"])
+            qp_clear()
+            return ("new", rid, day)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "edit" and qp.get("booking"):
+        try:
+            bid = int(qp["booking"])
+            qp_clear()
+            return ("edit", bid)
+        except Exception:
+            qp_clear()
+            return None
+
+    if action == "room" and qp.get("room"):
+        try:
+            rid = int(qp["room"])
+            qp_clear()
+            return ("room", rid)
+        except Exception:
+            qp_clear()
+            return None
+
+    qp_clear()
+    return None
+
+# =========================================================
+# AUTH UI
+# =========================================================
+def login_screen():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.markdown(f"## {APP_TITLE}")
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+        st.markdown("### Connexion")
+        u = st.text_input("Nom d'utilisateur", value="admin", key="login_user")
+        p = st.text_input("Mot de passe", type="password", value="admin", key="login_pass")
+        if st.button("Se connecter", use_container_width=True, key="login_btn"):
+            with SessionLocal() as db:
+                user = db.query(User).filter(User.username == u, User.active == True).first()
+                if user and verify_pw(p, user.password_hash):
+                    st.session_state["user"] = {"username": user.username, "role": user.role}
+                    log(db, user.username, "LOGIN", "Connexion")
+                    st.rerun()
+                else:
+                    st.error("Identifiants invalides.")
+
+def do_logout():
+    try:
+        with SessionLocal() as db:
+            log(db, st.session_state.get("user", {}).get("username", "unknown"), "LOGOUT", "Déconnexion")
+    except Exception:
+        pass
+    st.session_state.pop("user", None)
+    qp_clear()
+    st.rerun()
+
+# =========================================================
+# NAV
+# =========================================================
+def sidebar_nav(ipad: bool):
+    with st.sidebar:
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+
+        role = st.session_state["user"]["role"]
+        pages_admin = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients", "Paramètres"]
+        pages_reception = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients"]
+        pages = pages_admin if role == "admin" else pages_reception
+
+        page = st.radio("Menu", pages, label_visibility="collapsed", key="nav_page")
+        st.divider()
+        st.caption(f"Connecté : **{st.session_state['user']['username']}** ({role})")
+        st.button("Logout", use_container_width=True, key="logout_btn", on_click=do_logout)
+
+        st.divider()
+        st.caption("Affichage")
+        st.toggle("Mode iPad (plein écran)", value=ipad, key="ipad_toggle_local")
+    return page
 
 # =========================================================
 # PDF
@@ -332,161 +472,6 @@ def build_invoice_pdf(booking: Booking) -> bytes:
     return buff.getvalue()
 
 # =========================================================
-# CSS + iPad mode
-# =========================================================
-def inject_css(ipad: bool):
-    st.markdown(
-        f"""
-        <style>
-        .main .block-container {{ padding-top: 1rem; padding-bottom: 2rem; max-width: 1450px; }}
-        .cellwrap {{ border-radius: 14px; padding: 0px; }}
-        .cellwrap button {{
-            width: 100% !important;
-            height: 74px !important;
-            border-radius: 14px !important;
-            border: none !important;
-            font-weight: 900 !important;
-            color: white !important;
-            white-space: normal !important;
-            line-height: 1.15 !important;
-        }}
-        .cellwrap.free button {{ background: {COLOR_FREE} !important; }}
-        .cellwrap.reserved button {{ background: {COLOR_RESERVED} !important; }}
-        .cellwrap.paid button {{ background: {COLOR_PAID} !important; }}
-        .cellwrap.blocked button {{ background: {COLOR_BLOCKED} !important; cursor: not-allowed !important; }}
-
-        .roomwrap button {{
-            width: 100% !important;
-            height: 58px !important;
-            border-radius: 14px !important;
-            font-weight: 900 !important;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-    if ipad:
-        st.markdown(
-            """
-            <style>
-              header {visibility: hidden;}
-              #MainMenu {visibility: hidden;}
-              footer {visibility: hidden;}
-              [data-testid="stSidebar"] {display: none;}
-              .main .block-container {max-width: 1600px; padding-top: 0.5rem;}
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-
-# =========================================================
-# QUERY PARAMS (planning reliable)
-# =========================================================
-def qp_open_new(room_id: int, day_iso: str):
-    st.query_params.update({"action": "new", "room": str(room_id), "d": day_iso})
-
-def qp_open_edit(booking_id: int):
-    st.query_params.update({"action": "edit", "booking": str(booking_id)})
-
-def qp_open_room(room_id: int):
-    st.query_params.update({"action": "room", "room": str(room_id)})
-
-def qp_clear():
-    st.query_params.clear()
-
-def apply_qp_to_panel():
-    qp = dict(st.query_params)
-    action = qp.get("action")
-    if not action:
-        return None
-
-    if action == "new" and qp.get("room") and qp.get("d"):
-        try:
-            rid = int(qp["room"])
-            day = dt.date.fromisoformat(qp["d"])
-            qp_clear()
-            return ("new", rid, day)
-        except Exception:
-            qp_clear()
-            return None
-
-    if action == "edit" and qp.get("booking"):
-        try:
-            bid = int(qp["booking"])
-            qp_clear()
-            return ("edit", bid)
-        except Exception:
-            qp_clear()
-            return None
-
-    if action == "room" and qp.get("room"):
-        try:
-            rid = int(qp["room"])
-            qp_clear()
-            return ("room", rid)
-        except Exception:
-            qp_clear()
-            return None
-
-    qp_clear()
-    return None
-
-# =========================================================
-# AUTH UI
-# =========================================================
-def login_screen():
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.markdown(f"## {APP_TITLE}")
-        if os.path.exists("logo.png"):
-            st.image("logo.png", use_container_width=True)
-        st.markdown("### Connexion")
-        u = st.text_input("Nom d'utilisateur", value="admin", key="login_user")
-        p = st.text_input("Mot de passe", type="password", value="admin", key="login_pass")
-        if st.button("Se connecter", width="stretch", key="login_btn"):
-            with SessionLocal() as db:
-                user = db.query(User).filter(User.username == u, User.active == True).first()
-                if user and verify_pw(p, user.password_hash):
-                    st.session_state["user"] = {"username": user.username, "role": user.role}
-                    log(db, user.username, "LOGIN", "Connexion")
-                    st.rerun()
-                else:
-                    st.error("Identifiants invalides.")
-
-def do_logout():
-    try:
-        with SessionLocal() as db:
-            log(db, st.session_state.get("user", {}).get("username", "unknown"), "LOGOUT", "Déconnexion")
-    except Exception:
-        pass
-    st.session_state.pop("user", None)
-    qp_clear()
-    st.rerun()
-
-# =========================================================
-# NAV
-# =========================================================
-def sidebar_nav(ipad: bool):
-    with st.sidebar:
-        if os.path.exists("logo.png"):
-            st.image("logo.png", use_container_width=True)
-
-        role = st.session_state["user"]["role"]
-        pages_admin = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients", "Paramètres"]
-        pages_reception = ["Planning", "Arrivées / Départs", "Calendrier", "Dossiers", "Dashboard", "Clients"]
-        pages = pages_admin if role == "admin" else pages_reception
-
-        page = st.radio("Menu", pages, label_visibility="collapsed", key="nav_page")
-        st.divider()
-        st.caption(f"Connecté : **{st.session_state['user']['username']}** ({role})")
-        st.button("Logout", width="stretch", key="logout_btn", on_click=do_logout)
-
-        st.divider()
-        st.caption("Affichage")
-        st.toggle("Mode iPad (plein écran)", value=ipad, key="ipad_toggle_local")
-    return page
-
-# =========================================================
 # PANELS
 # =========================================================
 def room_controls(db, room: Room, prefix: str):
@@ -544,7 +529,7 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
 
     if client:
         st.success(f"Client sélectionné : **{client.full_name}**")
-        if st.button("Changer de client", width="stretch", key=f"{prefix}_change_client"):
+        if st.button("Changer de client", use_container_width=True, key=f"{prefix}_change_client"):
             st.session_state[selected_client_key] = None
             st.rerun()
 
@@ -559,7 +544,7 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
             if matches:
                 chosen = st.selectbox("Sélectionner", [f"#{c.id} — {c.full_name}" for c in matches], key=f"{prefix}_client_sel")
                 cid = int(chosen.split("—")[0].strip().replace("#", ""))
-                if st.button("Utiliser ce client", width="stretch", key=f"{prefix}_use_client"):
+                if st.button("Utiliser ce client", use_container_width=True, key=f"{prefix}_use_client"):
                     st.session_state[selected_client_key] = cid
                     st.rerun()
             else:
@@ -571,7 +556,7 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
             email = st.text_input("Email", key=f"{prefix}_newc_email")
             address = st.text_input("Adresse", key=f"{prefix}_newc_addr")
 
-            if st.button("Créer et utiliser ce client", width="stretch", key=f"{prefix}_newc_btn"):
+            if st.button("Créer et utiliser ce client", use_container_width=True, key=f"{prefix}_newc_btn"):
                 if not name.strip():
                     st.error("Nom requis.")
                 else:
@@ -618,7 +603,7 @@ def create_booking_panel(db, default_room: Room, default_checkin: dt.date, prefi
     st.info(f"Nuits: {nights} — Total chambres estimé: **{total_rooms:.2f} €** (hors extras)")
 
     disabled = (checkout <= checkin) or (client is None) or (len(selected_room_ids) == 0)
-    if st.button("Créer le dossier", width="stretch", type="primary", disabled=disabled, key=f"{prefix}_create_btn"):
+    if st.button("Créer le dossier", use_container_width=True, type="primary", disabled=disabled, key=f"{prefix}_create_btn"):
         for rid in selected_room_ids:
             r = db.get(Room, rid)
             if r.maintenance or room_blocked_in_range(db, rid, checkin, checkout) or booking_conflicts_for_room(db, rid, checkin, checkout):
@@ -677,7 +662,7 @@ def booking_panel(db, b: Booking, prefix: str):
     new_rooms_labels = st.multiselect("Chambres du dossier", labels, default=default, key=f"{prefix}_rooms_edit")
     new_room_ids = [int(lbl.split("[id:")[1].replace("]", "").strip()) for lbl in new_rooms_labels]
 
-    if st.button("Enregistrer modifications", width="stretch", key=f"{prefix}_save"):
+    if st.button("Enregistrer modifications", use_container_width=True, key=f"{prefix}_save"):
         if new_co <= new_ci:
             st.error("Dates invalides.")
             return
@@ -736,7 +721,7 @@ def booking_panel(db, b: Booking, prefix: str):
     c1, c2, c3 = st.columns(3)
     with c1:
         if not b.paid:
-            if st.button("Encaisser", width="stretch", type="primary", key=f"{prefix}_pay"):
+            if st.button("Encaisser", use_container_width=True, type="primary", key=f"{prefix}_pay"):
                 b.paid = True
                 b.paid_at = dt.datetime.utcnow()
                 if not (b.invoice_number or "").strip():
@@ -748,7 +733,7 @@ def booking_panel(db, b: Booking, prefix: str):
             st.info("Déjà payé ✅")
 
     with c2:
-        if st.button("Facture PDF", width="stretch", key=f"{prefix}_pdf"):
+        if st.button("Facture PDF", use_container_width=True, key=f"{prefix}_pdf"):
             if not (b.invoice_number or "").strip():
                 b.invoice_number = next_invoice_number(db)
                 db.commit()
@@ -758,12 +743,12 @@ def booking_panel(db, b: Booking, prefix: str):
                 data=pdf_bytes,
                 file_name=f"facture_{b.invoice_number or ('booking_'+str(b.id))}.pdf",
                 mime="application/pdf",
-                width="stretch",
+                use_container_width=True,
                 key=f"{prefix}_pdf_dl"
             )
 
     with c3:
-        if st.button("Supprimer dossier", width="stretch", key=f"{prefix}_delete"):
+        if st.button("Supprimer dossier", use_container_width=True, key=f"{prefix}_delete"):
             bid = b.id
             db.delete(b)
             db.commit()
@@ -823,13 +808,7 @@ def planning_week_page():
             with row[0]:
                 st.markdown("<div class='roomwrap'>", unsafe_allow_html=True)
                 label = f"{room.name}" + (" 🛠️" if room.maintenance else "")
-                st.button(
-                    label,
-                    width="stretch",
-                    key=f"room_btn_{room.id}",
-                    on_click=qp_open_room,
-                    args=(room.id,)
-                )
+                st.button(label, use_container_width=True, key=f"room_btn_{room.id}", on_click=qp_open_room, args=(room.id,))
                 st.markdown("</div>", unsafe_allow_html=True)
 
             room_bookings = by_room_bookings.get(room.id, [])
@@ -839,14 +818,14 @@ def planning_week_page():
                 with row[idx]:
                     if room.maintenance:
                         st.markdown("<div class='cellwrap blocked'>", unsafe_allow_html=True)
-                        st.button("Travaux", width="stretch", disabled=True, key=f"blk_global_{room.id}_{d.isoformat()}")
+                        st.button("Travaux", use_container_width=True, disabled=True, key=f"blk_global_{room.id}_{d.isoformat()}")
                         st.markdown("</div>", unsafe_allow_html=True)
                         continue
 
                     bl = next((b for b in room_blocks if (b.start <= d < b.end)), None)
                     if bl:
                         st.markdown("<div class='cellwrap blocked'>", unsafe_allow_html=True)
-                        st.button(f"Travaux\n{bl.reason}", width="stretch", disabled=True, key=f"blk_{bl.id}_{d.isoformat()}")
+                        st.button(f"Travaux\n{bl.reason}", use_container_width=True, disabled=True, key=f"blk_{bl.id}_{d.isoformat()}")
                         st.markdown("</div>", unsafe_allow_html=True)
                         continue
 
@@ -854,33 +833,24 @@ def planning_week_page():
 
                     if b is None:
                         st.markdown("<div class='cellwrap free'>", unsafe_allow_html=True)
-                        st.button(
-                            "Libre",
-                            width="stretch",
-                            key=f"free_{room.id}_{d.isoformat()}",
-                            on_click=qp_open_new,
-                            args=(room.id, d.isoformat()),
-                        )
+                        st.button("Libre", use_container_width=True, key=f"free_{room.id}_{d.isoformat()}",
+                                  on_click=qp_open_new, args=(room.id, d.isoformat()))
                         st.markdown("</div>", unsafe_allow_html=True)
                     else:
                         cls = "paid" if b.paid else "reserved"
                         label = "Payé" if b.paid else "Réservé"
                         client_name = b.client.full_name if b.client else "Client"
                         st.markdown(f"<div class='cellwrap {cls}'>", unsafe_allow_html=True)
-                        st.button(
-                            f"{label}\n{client_name}",
-                            width="stretch",
-                            key=f"bk_{b.id}_{room.id}_{d.isoformat()}",
-                            on_click=qp_open_edit,
-                            args=(b.id,),
-                        )
+                        st.button(f"{label}\n{client_name}", use_container_width=True,
+                                  key=f"bk_{b.id}_{room.id}_{d.isoformat()}",
+                                  on_click=qp_open_edit, args=(b.id,))
                         st.markdown("</div>", unsafe_allow_html=True)
 
         st.divider()
 
         panel = st.session_state.get("panel")
         if panel:
-            if st.button("Fermer le panneau", width="stretch", key="close_panel_btn"):
+            if st.button("Fermer le panneau", use_container_width=True, key="close_panel_btn"):
                 st.session_state["panel"] = None
                 st.rerun()
 
@@ -928,19 +898,19 @@ def arrivals_departures_today_page():
 
         t1, t2 = st.tabs([f"Arrivées ({len(arrivals)})", f"Départs ({len(departures)})"])
         with t1:
-            st.dataframe(pd.DataFrame([row_public(b) for b in arrivals]) if arrivals else pd.DataFrame(),
-                         width="stretch", hide_index=True)
-            if not arrivals:
+            if arrivals:
+                st.dataframe(pd.DataFrame([row_public(b) for b in arrivals]), use_container_width=True, hide_index=True)
+            else:
                 st.info("Aucune arrivée aujourd’hui.")
         with t2:
-            st.dataframe(pd.DataFrame([row_public(b) for b in departures]) if departures else pd.DataFrame(),
-                         width="stretch", hide_index=True)
-            if not departures:
+            if departures:
+                st.dataframe(pd.DataFrame([row_public(b) for b in departures]), use_container_width=True, hide_index=True)
+            else:
                 st.info("Aucun départ aujourd’hui.")
 
         st.divider()
         bid = st.number_input("Ouvrir un dossier (ID)", min_value=0, value=0, step=1, key="ad_open_id")
-        if st.button("Ouvrir", width="stretch", key="ad_open_btn") and bid > 0:
+        if st.button("Ouvrir", use_container_width=True, key="ad_open_btn") and bid > 0:
             qp_open_edit(int(bid))
             st.rerun()
 
@@ -1029,10 +999,10 @@ def bookings_list_page():
             "extras": b.extras,
             "acompte": b.deposit,
         } for b in items])
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
         bid = st.number_input("Ouvrir dossier (ID)", min_value=0, value=0, step=1, key="bk_open_id")
-        if st.button("Ouvrir", width="stretch", key="bk_open_btn") and bid > 0:
+        if st.button("Ouvrir", use_container_width=True, key="bk_open_btn") and bid > 0:
             qp_open_edit(int(bid))
             st.rerun()
 
@@ -1096,12 +1066,12 @@ def dashboard_page():
         days = pd.date_range(start=start, end=end, freq="D")
         df = pd.DataFrame({"date": [d.date() for d in days], "ca": [float(revenue_by_day.get(d.date(), 0.0)) for d in days]})
         fig = px.bar(df, x="date", y="ca", title="Chiffre d'affaires payé (€/jour)")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
         st.markdown("### Export mensuel (ZIP CSV)")
         month = st.text_input("Mois (YYYY-MM)", value=dt.date.today().strftime("%Y-%m"), key="exp_month")
-        if st.button("Générer export mensuel", width="stretch", key="exp_month_btn"):
+        if st.button("Générer export mensuel", use_container_width=True, key="exp_month_btn"):
             try:
                 y, m = map(int, month.split("-"))
                 m_start = dt.date(y, m, 1)
@@ -1146,22 +1116,9 @@ def dashboard_page():
                     "created_at": c.created_at.isoformat() if c.created_at else "",
                 })
 
-            total_ca = 0.0
-            total_room = 0.0
-            total_extras = 0.0
-            for b in m_bookings:
-                nights = nights_count(b.checkin, b.checkout)
-                rooms_total = sum(float(br.price_per_night) for br in b.rooms) * nights
-                total_room += rooms_total
-                total_extras += float(b.extras or 0.0)
-                total_ca += rooms_total + float(b.extras or 0.0)
-
             summary = pd.DataFrame([{
                 "month": month,
                 "bookings": len(m_bookings),
-                "room_revenue": total_room,
-                "extras": total_extras,
-                "total": total_ca,
             }])
 
             buf = io.BytesIO()
@@ -1175,7 +1132,7 @@ def dashboard_page():
                 data=buf.getvalue(),
                 file_name=f"export_{month}.zip",
                 mime="application/zip",
-                width="stretch",
+                use_container_width=True,
                 key="exp_dl"
             )
 
@@ -1199,7 +1156,7 @@ def clients_page():
             "email": c.email,
             "adresse": c.address
         } for c in clients])
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def settings_page():
@@ -1222,7 +1179,7 @@ def settings_page():
             new_price = st.number_input("Prix / nuit (€)", min_value=0.0, value=float(room.price), step=1.0, key="set_room_price")
             maint = st.toggle("Travaux global", value=room.maintenance, key="set_room_maint")
 
-            if st.button("Enregistrer chambre", width="stretch", key="set_room_save"):
+            if st.button("Enregistrer chambre", use_container_width=True, key="set_room_save"):
                 room.name = new_name.strip() if new_name.strip() else room.name
                 room.number = new_number.strip() if new_number.strip() else room.number
                 room.price = float(new_price)
@@ -1237,7 +1194,7 @@ def settings_page():
             nu = st.text_input("Username", key="u_new_user")
             npw = st.text_input("Mot de passe", type="password", key="u_new_pw")
             nrole = st.selectbox("Rôle", ["reception", "admin"], key="u_new_role")
-            if st.button("Créer", width="stretch", key="u_new_btn"):
+            if st.button("Créer", use_container_width=True, key="u_new_btn"):
                 if not nu.strip() or not npw.strip():
                     st.error("Username et mot de passe requis.")
                 else:
@@ -1264,7 +1221,7 @@ def settings_page():
             with c2:
                 reset_pw = st.text_input("Nouveau mot de passe", type="password", key="u_reset_pw")
 
-            if st.button("Enregistrer utilisateur", width="stretch", key="u_save_btn"):
+            if st.button("Enregistrer utilisateur", use_container_width=True, key="u_save_btn"):
                 u.role = u_role
                 u.active = bool(u_active)
                 if reset_pw.strip():
@@ -1279,7 +1236,7 @@ def settings_page():
             s = db.get(Setting, "ipad_mode")
             current = (s.value or "0") == "1"
             v = st.toggle("Activer mode iPad par défaut", value=current, key="ipad_default_toggle")
-            if st.button("Enregistrer", width="stretch", key="ipad_save_btn"):
+            if st.button("Enregistrer", use_container_width=True, key="ipad_save_btn"):
                 s.value = "1" if v else "0"
                 db.commit()
                 log(db, st.session_state["user"]["username"], "IPAD_DEFAULT", s.value)
@@ -1289,7 +1246,7 @@ def settings_page():
         with t_logs:
             logs = db.query(AuditLog).order_by(AuditLog.ts.desc()).limit(300).all()
             df = pd.DataFrame([{"ts": l.ts, "user": l.username, "action": l.action, "meta": l.meta} for l in logs])
-            st.dataframe(df, width="stretch", hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
 # =========================================================
 # MAIN
